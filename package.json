@@ -1,0 +1,12 @@
+{
+  "name": "arena-of-clodo-server",
+  "version": "1.0.0",
+  "description": "Serveur relais multijoueur d'Arena of Clodo Legends (salons + lockstep)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
