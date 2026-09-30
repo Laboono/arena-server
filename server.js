@@ -207,7 +207,7 @@ function handle(p, raw) {
     case "hello":
       p.name = String(m.name || "Gladiateur").slice(0, 20);
       p.ver = String(m.ver || "");
-      p.sock.send({ t: "welcome", id: p.id });
+      p.sock.send({ t: "welcome", id: p.id, proto: 2 });
       break;
     case "create": {
       if (r) leaveRoom(p);
