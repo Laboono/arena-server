@@ -131,12 +131,12 @@ function leaveRoom(p) {
   if (!r) return;
   p.room = null;
   r.players.delete(p.id);
-  if (r.players.size === 0) { rooms.delete(r.code); return; }
+  if (r.players.size === 0) { stopGame(r); rooms.delete(r.code); return; }
   if (r.phase === "game" && r.game && r.game.active.has(p.id)) {
     r.game.active.delete(p.id);
     r.game.drops.push({ c: "drop", team: p.team, slot: p.slot });
     broadcast(r, { t: "left", id: p.id, name: p.name, team: p.team, slot: p.slot });
-    flushTurns(r);
+    if (!r.game.t0) { let all = true; for (const id of r.game.active) if (!r.game.ready.has(id)) all = false; if (all) beginClock(r); }
   } else if (r.phase === "lobby") {
     compactSlots(r);
   } else {
@@ -148,46 +148,54 @@ function leaveRoom(p) {
   pushRoom(r);
 }
 
-// ------------------------------------------------------------------ lockstep
+// ------------------------------------------------------------------ horloge du combat
+// Le serveur donne le rythme : un « tour » toutes les TURN_MS, avec les commandes reçues
+// depuis le tour précédent. Un joueur lent ou qui décroche ne bloque plus les autres.
+const TURN_MS = 50;
 function startGame(r) {
   r.phase = "game";
+  stopGame(r);
   r.game = {
     active: new Set(r.players.keys()),
-    inputs: new Map(),     // tour -> Map(id -> cmds)
+    ready: new Set(),
+    pending: [],           // commandes reçues depuis le dernier tour
     hashes: new Map(),     // tour -> Map(id -> hash)
-    next: 0,               // prochain tour à diffuser
+    next: 0,
     drops: [],
-    waitSince: Date.now(),
+    t0: 0,                 // début de l'horloge (0 = pas encore lancée)
+    created: Date.now(),
+    lastSeen: new Map(),
   };
+  for (const id of r.players.keys()) r.game.lastSeen.set(id, Date.now());
 }
 
-function flushTurns(r) {
+function stopGame(r) {
+  if (r.game && r.game.timer) clearInterval(r.game.timer);
+}
+
+function beginClock(r) {
   const g = r.game;
-  if (!g) return;
-  for (;;) {
-    const got = g.inputs.get(g.next) || new Map();
-    let complete = true;
-    for (const id of g.active) if (!got.has(id)) { complete = false; break; }
-    if (!complete && g.active.size > 0) return;
-    let cmds = [];
-    // ordre stable : par équipe puis emplacement
-    const order = [...r.players.values()].sort((a, b) => (a.team - b.team) || (a.slot - b.slot));
-    for (const p of order) if (got.has(p.id)) cmds = cmds.concat(got.get(p.id));
+  if (!g || g.t0) return;
+  g.t0 = Date.now();
+  g.timer = setInterval(() => tickGame(r), 10);
+}
+
+function tickGame(r) {
+  const g = r.game;
+  if (!g || r.phase !== "game") { stopGame(r); return; }
+  const due = Math.floor((Date.now() - g.t0) / TURN_MS);
+  let guard = 0;
+  while (g.next <= due && guard++ < 40) {
+    let cmds = g.pending;
+    g.pending = [];
     if (g.drops.length) { cmds = cmds.concat(g.drops); g.drops = []; }
     broadcast(r, { t: "turn", k: g.next, c: cmds });
-    // contrôle anti-désynchronisation
-    const hs = g.hashes.get(g.next);
-    if (hs && hs.size >= 2) {
-      const vals = new Set(hs.values());
-      if (vals.size > 1) broadcast(r, { t: "desync", k: g.next });
-    }
-    g.inputs.delete(g.next);
-    g.hashes.delete(g.next);
     g.next++;
-    g.waitSince = Date.now();
-    if (g.active.size === 0) return;
   }
 }
+
+// compat : l'ancien code appelait flushTurns après un départ
+function flushTurns(r) {}
 
 // ------------------------------------------------------------------ messages
 function handle(p, raw) {
@@ -264,7 +272,7 @@ function handle(p, raw) {
     }
     case "phase":
       if (!r || r.host !== p.id) return;
-      if (m.phase === "lobby") { r.phase = "lobby"; r.game = null; }
+      if (m.phase === "lobby") { stopGame(r); r.phase = "lobby"; r.game = null; }
       else if (m.phase === "draft") { if (r.phase === "lobby") r.phase = "draft"; }
       pushRoom(r);
       break;
@@ -282,18 +290,29 @@ function handle(p, raw) {
       startGame(r);
       pushRoom(r);
       break;
+    case "ready": {
+      // le combat est chargé chez ce joueur ; l'horloge démarre quand tout le monde est prêt
+      if (!r || !r.game) return;
+      r.game.ready.add(p.id);
+      let all = true;
+      for (const id of r.game.active) if (!r.game.ready.has(id)) all = false;
+      if (all) beginClock(r);
+      break;
+    }
     case "in": {
       if (!r || !r.game || !r.game.active.has(p.id)) return;
-      const k = Number(m.k) | 0;
-      if (k < r.game.next || k > r.game.next + 400) return;
-      if (!r.game.inputs.has(k)) r.game.inputs.set(k, new Map());
+      const g = r.game;
+      g.lastSeen.set(p.id, Date.now());
       const cmds = Array.isArray(m.c) ? m.c.slice(0, 32) : [];
-      r.game.inputs.get(k).set(p.id, cmds);
+      for (const c of cmds) if (c && typeof c === "object") g.pending.push(c);
       if (m.h !== undefined) {
-        if (!r.game.hashes.has(k)) r.game.hashes.set(k, new Map());
-        r.game.hashes.get(k).set(p.id, m.h);
+        const k = Number(m.k) | 0;
+        if (!g.hashes.has(k)) g.hashes.set(k, new Map());
+        const hs = g.hashes.get(k);
+        hs.set(p.id, m.h);
+        if (hs.size >= 2 && new Set(hs.values()).size > 1) broadcast(r, { t: "desync", k: k });
+        if (g.hashes.size > 50) g.hashes.delete(g.hashes.keys().next().value);
       }
-      flushTurns(r);
       break;
     }
     case "ping":
@@ -314,14 +333,8 @@ setInterval(() => {
   for (const r of rooms.values()) {
     const g = r.game;
     if (!g || r.phase !== "game" || g.active.size === 0) continue;
-    if (now - g.waitSince < (g.next < 20 ? START_TIMEOUT_MS : TURN_TIMEOUT_MS)) continue;
-    const got = g.inputs.get(g.next) || new Map();
-    for (const id of [...g.active]) {
-      if (!got.has(id)) {
-        const p = r.players.get(id);
-        if (p) { p.sock.send({ t: "error", msg: "Connexion trop lente : vous avez été retiré de la partie." }); p.sock.close(); }
-      }
-    }
+    // l'horloge démarre même si quelqu'un tarde à charger
+    if (!g.t0 && now - g.created > START_TIMEOUT_MS / 4) beginClock(r);
   }
 }, 2000);
 
