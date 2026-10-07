@@ -18,6 +18,8 @@ const TURN_TIMEOUT_MS = 20000;     // un joueur muet trop longtemps est déconne
 const START_TIMEOUT_MS = 60000;    // plus de patience au lancement (chargement du combat)
 const HASH_EVERY = 40;             // contrôle anti-désynchronisation (tours)
 const MAX_ROOMS = 500;
+const PROTO = 5;                   // 5 : recherche de partie (files 1v1…4v4)
+const ACCEPT_MS = Number(process.env.ACCEPT_MS) || 10000;   // fenêtre « Partie trouvée ! »
 
 // ------------------------------------------------------------------ WebSocket minimal (RFC 6455)
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -104,6 +106,7 @@ function newCode() {
 function roomState(r) {
   return {
     t: "room", code: r.code, host: r.host, size: r.size, diff: r.diff, phase: r.phase, ver: r.ver, mode: r.mode || "classic",
+    mm: r.mm ? r.qsize : 0,
     players: [...r.players.values()].map((p) => ({ id: p.id, name: p.name, team: p.team, slot: p.slot })),
   };
 }
@@ -159,6 +162,130 @@ function leaveRoom(p) {
     r.host = [...r.players.keys()][0];
   }
   pushRoom(r);
+}
+
+// ------------------------------------------------------------------ recherche de partie (files 1v1…4v4)
+// Une file par taille d'équipe ET par version du jeu (on ne mélange pas les versions).
+// Dès qu'une file contient 2×taille joueurs, une « partie trouvée » est proposée : chacun a
+// ACCEPT_MS pour accepter. Si tout le monde accepte, le serveur crée un salon normal (équipes
+// réparties) et passe directement à la draft. Sinon, ceux qui ont refusé / pas répondu sortent
+// de la file et les autres y retournent en tête. Aucune IA : uniquement de vrais joueurs.
+const clients = new Set();   // tous les joueurs connectés
+const queues = new Map();    // "version|taille" -> [joueurs] (ordre d'arrivée)
+const matches = new Map();   // id -> partie proposée en attente d'acceptation
+let nextMatch = 1;
+const QSIZES = [1, 2, 3, 4];
+
+function qkey(ver, size) { return ver + "|" + size; }
+function qlist(key) { if (!queues.has(key)) queues.set(key, []); return queues.get(key); }
+
+function queueCounts(ver) {
+  const c = QSIZES.map((s) => qlist(qkey(ver, s)).length);
+  for (const m of matches.values()) if (m.ver === ver) c[m.size - 1] += m.players.length;
+  return c;
+}
+// envoie le nombre de joueurs en recherche à tous ceux de cette version qui ne sont pas dans un salon
+function pushCounts(ver) {
+  const c = queueCounts(ver);
+  for (const q of clients) if (q.ver === ver && !q.room && q.proto >= 5) q.sock.send({ t: "qcount", c });
+}
+function sendQueue(p) {
+  p.sock.send(p.queue ? { t: "queue", size: p.qsize, el: Date.now() - p.qsince } : { t: "queue", size: 0 });
+}
+
+function enqueue(p, size, head) {
+  const key = qkey(p.ver, size);
+  const q = qlist(key);
+  if (head) q.unshift(p); else q.push(p);
+  p.queue = key; p.qsize = size;
+  if (!head) p.qsince = Date.now();
+  sendQueue(p);
+}
+
+function dequeue(p, notify) {
+  if (!p.queue) return false;
+  const q = qlist(p.queue);
+  const i = q.indexOf(p);
+  if (i >= 0) q.splice(i, 1);
+  p.queue = null;
+  if (notify) sendQueue(p);
+  return true;
+}
+
+function tryMatch(ver, size) {
+  const q = qlist(qkey(ver, size));
+  while (q.length >= size * 2) {
+    const group = q.splice(0, size * 2);
+    const m = { id: nextMatch++, ver, size, players: group, acc: new Set(), timer: null };
+    matches.set(m.id, m);
+    for (const p of group) {
+      p.queue = null; p.match = m;
+      p.sock.send({ t: "match", id: m.id, size, n: group.length, ms: ACCEPT_MS });
+    }
+    m.timer = setTimeout(() => {
+      // délai écoulé : ceux qui n'ont pas accepté sortent de la file
+      cancelMatch(m, m.players.filter((p) => !m.acc.has(p.id)), "timeout");
+    }, ACCEPT_MS + 400);
+  }
+}
+
+// annule une partie proposée : `out` quittent la recherche, les autres retournent en tête de file
+function cancelMatch(m, out, reason) {
+  if (!matches.has(m.id)) return;
+  matches.delete(m.id);
+  clearTimeout(m.timer);
+  const outSet = new Set(out);
+  const back = m.players.filter((p) => !outSet.has(p) && p.sock.open);
+  // ceux qui avaient accepté passent devant ceux qui n'avaient pas encore répondu
+  back.sort((a, b) => (m.acc.has(b.id) ? 1 : 0) - (m.acc.has(a.id) ? 1 : 0));
+  for (const p of m.players) p.match = null;
+  for (const p of out) if (p.sock.open) p.sock.send({ t: "match_cancel", requeued: false, reason });
+  for (let i = back.length - 1; i >= 0; i--) {
+    const p = back[i];
+    p.sock.send({ t: "match_cancel", requeued: true, reason });
+    enqueue(p, m.size, true);
+  }
+  tryMatch(m.ver, m.size);
+  pushCounts(m.ver);
+}
+
+function acceptMatch(p) {
+  const m = p.match;
+  if (!m || m.acc.has(p.id)) return;
+  m.acc.add(p.id);
+  for (const q of m.players) q.sock.send({ t: "match_acc", id: m.id, acc: m.acc.size, n: m.players.length });
+  if (m.acc.size >= m.players.length) launchMatch(m);
+}
+
+// tout le monde a accepté : salon normal (comme une partie perso), équipes réparties, puis draft
+function launchMatch(m) {
+  matches.delete(m.id);
+  clearTimeout(m.timer);
+  if (rooms.size >= MAX_ROOMS) {
+    for (const p of m.players) p.match = null;
+    for (const p of m.players) { p.sock.send({ t: "error", msg: "Serveur plein, réessayez plus tard." }); p.sock.send({ t: "match_cancel", requeued: false, reason: "full" }); }
+    pushCounts(m.ver);
+    return;
+  }
+  const code = newCode();
+  const room = { code, host: m.players[0].id, size: MAX_PLAYERS, diff: 1, phase: "lobby", ver: m.ver, players: new Map(), game: null, mode: "classic", mm: true, qsize: m.size };
+  rooms.set(code, room);
+  m.players.forEach((p, i) => {
+    p.match = null;
+    if (p.room) leaveRoom(p);
+    p.room = room; p.team = i % 2; p.slot = Math.floor(i / 2);
+    room.players.set(p.id, p);
+  });
+  compactSlots(room);
+  room.phase = "draft";
+  pushRoom(room);
+  pushCounts(m.ver);
+}
+
+// le joueur quitte toute recherche (file ou partie proposée = refus)
+function leaveSearch(p, reason) {
+  if (p.match) cancelMatch(p.match, [p], reason);
+  else if (dequeue(p, true)) pushCounts(p.ver);
 }
 
 // ------------------------------------------------------------------ horloge du combat
@@ -220,9 +347,33 @@ function handle(p, raw) {
     case "hello":
       p.name = String(m.name || "Gladiateur").slice(0, 20);
       p.ver = String(m.ver || "");
-      p.sock.send({ t: "welcome", id: p.id, proto: 4 });
+      p.proto = Number(m.proto) || 4;
+      p.sock.send({ t: "welcome", id: p.id, proto: PROTO });
+      if (p.proto >= 5) p.sock.send({ t: "qcount", c: queueCounts(p.ver) });
+      break;
+    case "queue": {
+      // entrer dans la file d'un mode (1v1…4v4) ; une seule file à la fois
+      const size = clamp(m.size, 1, 4, 1);
+      if (r) { p.sock.send({ t: "error", msg: "Quittez le salon avant de rechercher une partie." }); sendQueue(p); return; }
+      if (p.match) return;
+      if (p.queue === qkey(p.ver, size)) { sendQueue(p); return; }
+      dequeue(p, false);
+      enqueue(p, size, false);
+      tryMatch(p.ver, size);
+      pushCounts(p.ver);
+      break;
+    }
+    case "unqueue":
+      leaveSearch(p, "declined");
+      break;
+    case "accept":
+      acceptMatch(p);
+      break;
+    case "decline":
+      if (p.match) cancelMatch(p.match, [p], "declined");
       break;
     case "create": {
+      leaveSearch(p, "declined");
       if (r) leaveRoom(p);
       if (rooms.size >= MAX_ROOMS) { p.sock.send({ t: "error", msg: "Serveur plein, réessayez plus tard." }); return; }
       const code = newCode();
@@ -240,6 +391,8 @@ function handle(p, raw) {
       if (room.ver !== p.ver) { p.sock.send({ t: "error", msg: "Version différente de celle de l'hôte (" + room.ver + "). Mettez le jeu à jour." }); return; }
       if (room.phase !== "lobby") { p.sock.send({ t: "error", msg: "La partie de ce salon a déjà commencé." }); return; }
       if (room.players.size >= MAX_PLAYERS) { p.sock.send({ t: "error", msg: "Salon complet." }); return; }
+      if (room.mm) { p.sock.send({ t: "error", msg: "Ce salon vient de la recherche de partie : impossible de le rejoindre." }); return; }
+      leaveSearch(p, "declined");
       if (r) leaveRoom(p);
       if (room.mode === "br") {
         p.team = room.players.size; p.slot = 0;
@@ -258,6 +411,7 @@ function handle(p, raw) {
     case "leave":
       leaveRoom(p);
       p.sock.send({ t: "left_room" });
+      if (p.proto >= 5) { p.sock.send({ t: "qcount", c: queueCounts(p.ver) }); sendQueue(p); }
       break;
     case "set":
       if (!r || r.host !== p.id || r.phase !== "lobby") return;
@@ -351,7 +505,9 @@ setInterval(() => {
 // ------------------------------------------------------------------ serveur HTTP + upgrade
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": "*" });
-  res.end("Arena of Clodo — serveur multijoueur OK. Salons actifs : " + rooms.size + "\n");
+  let nq = 0;
+  for (const q of queues.values()) nq += q.length;
+  res.end("Arena of Clodo — serveur multijoueur OK. Salons actifs : " + rooms.size + " · en recherche : " + nq + "\n");
 });
 
 server.on("upgrade", (req, socket) => {
@@ -359,14 +515,19 @@ server.on("upgrade", (req, socket) => {
   if (!key || (req.headers.upgrade || "").toLowerCase() !== "websocket") { socket.destroy(); return; }
   const accept = crypto.createHash("sha1").update(key + GUID).digest("base64");
   socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n");
-  const p = { id: nextId++, name: "Gladiateur", ver: "", room: null, team: 0, slot: 0, sock: new Sock(socket) };
+  const p = { id: nextId++, name: "Gladiateur", ver: "", proto: 4, room: null, team: 0, slot: 0, queue: null, qsize: 0, qsince: 0, match: null, sock: new Sock(socket) };
+  clients.add(p);
   p.sock.onmessage = (msg) => { try { handle(p, msg); } catch (e) { console.error(e); } };
-  p.sock.onclose = () => leaveRoom(p);
+  p.sock.onclose = () => {
+    clients.delete(p);
+    try { leaveSearch(p, "left"); } catch (e) { console.error(e); }
+    leaveRoom(p);
+  };
 });
 
 // garde les connexions en vie derrière les hébergeurs (ping toutes les 25 s)
 setInterval(() => {
-  for (const r of rooms.values()) for (const p of r.players.values()) p.sock._send(0x9, Buffer.alloc(0));
+  for (const p of clients) p.sock._send(0x9, Buffer.alloc(0));
 }, 25000);
 
 server.listen(PORT, () => console.log("Serveur Arena of Clodo à l'écoute sur le port " + PORT));
